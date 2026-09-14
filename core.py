@@ -1,5 +1,5 @@
 """
-Bankacılık düzeyinde Türkçe Konuşmadan Metne (STT) pipeline'ı.
+Türkçe Konuşmadan Metne (STT) pipeline'ı.
 
 Mimari:
   STTPipeline (sınıf)  → İç OOP motor
@@ -11,24 +11,32 @@ Felsefe: TAHMİN ETME, REDDET.
 """
 
 import os
+
+# ── Ortam Değişkenleri ─────────────────────────────────────────────────────
+# huggingface_hub bu değerleri import anında modül seviyesinde sabitlere okur,
+# bu yüzden huggingface_hub'ı (transitive olarak faster_whisper üzerinden)
+# import etmeden ÖNCE ayarlanmaları şart — aksi halde XET indirme yolu
+# devre dışı kalmaz ve indirme (yavaş/engelli ağlarda) donmuş gibi görünür.
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+os.environ["HF_HUB_DISABLE_EXPERIMENTAL_WARNING"] = "1"
+
+import re
 import time
 import queue
 import logging
-from typing import Callable, Optional
+import concurrent.futures
+from pathlib import Path
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import requests
 import sounddevice as sd
 from faster_whisper import WhisperModel
 
-from config import STTConfig, BANKING_INITIAL_PROMPT
+from config import STTConfig, DEFAULT_TECHNICAL_TERMS, BANKING_TERMS
 from models import TranscriptionResult, TranscriptionStatus, SegmentDetail
 from meeting_assistant import MeetingAssistant
 from filters import HallucinationFilter
-
-# ── Ortam Değişkenleri ─────────────────────────────────────────────────────
-os.environ["HF_HUB_DISABLE_XET"] = "1"
-os.environ["HF_HUB_DISABLE_EXPERIMENTAL_WARNING"] = "1"
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 class STTPipeline:
     """
-    Bankacılık düzeyinde gerçek zamanlı STT pipeline'ı.
+    Gerçek zamanlı STT pipeline'ı.
 
     Özellikler:
       - Model ısınması (JIT derleme için sessiz ses transkripsiyon)
@@ -56,9 +64,15 @@ class STTPipeline:
         config: STTConfig,
         on_result: Optional[Callable[[TranscriptionResult], None]] = None,
         on_audio_chunk: Optional[Callable[[np.ndarray], None]] = None,
+        silent: bool = False,
     ):
         self.config = config
-        self.on_result = on_result or self._default_callback
+        self.silent = silent
+        # Silent mode'da sadece dosyaya yaz, terminal çıktı yapma
+        if silent:
+            self.on_result = on_result or (lambda x: None)  # Boş callback
+        else:
+            self.on_result = on_result or self._default_callback
         self.on_audio_chunk = on_audio_chunk
         self.halucination_filter = HallucinationFilter(config)
 
@@ -126,11 +140,16 @@ class STTPipeline:
         formatted_repo = f"models--{repo_id.replace('/', '--')}"
         model_path = os.path.join(cache_dir, formatted_repo)
 
-        # Dizin ve snapshot kontrolü
+        # Dizin ve snapshot kontrolü — sadece klasör değil, asıl model ağırlığının
+        # (model.bin) var olduğuna bak. Aksi halde yarım kalmış bir indirme
+        # "yerelde var" sanılıp local_files_only=True ile internetten
+        # tamamlanması engellenir ve yükleme çöker.
         if os.path.exists(model_path):
             snapshots_dir = os.path.join(model_path, "snapshots")
-            if os.path.exists(snapshots_dir) and os.listdir(snapshots_dir):
-                return True
+            if os.path.exists(snapshots_dir):
+                for snapshot in os.listdir(snapshots_dir):
+                    if os.path.exists(os.path.join(snapshots_dir, snapshot, "model.bin")):
+                        return True
 
         # Doğrudan yerel bir klasör yolu verilmişse
         if os.path.exists(model_name):
@@ -165,8 +184,10 @@ class STTPipeline:
         """sounddevice callback — veriyi kuyruğa ekle, engelleme yapma."""
         if status:
             logger.warning("Mikrofon hatası: %s", status)
+        # Çok kanallı giriş (ör. mikrofon + BlackHole aggregate cihazı) → mono'ya indirge
+        mono = indata if indata.shape[1] == 1 else indata.mean(axis=1, keepdims=True)
         try:
-            self._audio_queue.put_nowait(indata.copy())
+            self._audio_queue.put_nowait(mono.copy())
         except queue.Full:
             # Kuyruk doluysa en eski chunk'ı at, yenisini ekle
             try:
@@ -174,7 +195,7 @@ class STTPipeline:
             except queue.Empty:
                 pass
             try:
-                self._audio_queue.put_nowait(indata.copy())
+                self._audio_queue.put_nowait(mono.copy())
             except queue.Full:
                 logger.warning("Audio kuyruk taşması — chunk atlandı")
 
@@ -228,12 +249,8 @@ class STTPipeline:
 
     # ── Transkripsiyon ─────────────────────────────────────────────────────
 
-    def _transcribe(self) -> TranscriptionResult:
-        """Tam filtreleme zinciri ile transkripsiyon çalıştır."""
-        start_time = time.perf_counter()
-
-        segments, _info = self._model.transcribe(
-            self._buffer,
+    def _whisper_params(self) -> dict:
+        return dict(
             language=self.config.language,
             beam_size=self.config.beam_size,
             temperature=self.config.temperature,
@@ -251,6 +268,12 @@ class STTPipeline:
             suppress_blank=self.config.suppress_blank,
         )
 
+    def _transcribe(self) -> TranscriptionResult:
+        """Tam filtreleme zinciri ile transkripsiyon çalıştır (canlı tampon)."""
+        start_time = time.perf_counter()
+
+        segments, _info = self._model.transcribe(self._buffer, **self._whisper_params())
+
         # Segmentleri filtrele
         valid_segments, confidence = self.halucination_filter.filter_segments(segments)
 
@@ -265,6 +288,64 @@ class STTPipeline:
             confidence,
             processing_ms,
         )
+
+    def transcribe_file_segments(self, audio_path: str) -> List[Tuple[float, TranscriptionResult]]:
+        """Bitmiş bir ses dosyasını (canlı mikrofon değil) segment segment transkript eder.
+
+        Her segment kendi (dosya başından itibaren saniye) zaman damgasıyla
+        döner - bu, konuşmacı ayrıştırma (diarization) sonuçlarının doğru
+        segmente eşlenebilmesi için gerekli. Tek bir metin bloğu değil, çok
+        konuşmacılı bir kayıtta her cümlenin kendi konuşmacısıyla
+        etiketlenebilmesini sağlar.
+
+        faster-whisper dosya yolunu doğrudan kabul edip kendi VAD'ıyla
+        segmentlere ayırdığı için, canlı akıştaki sessizlik/max-speech
+        tahminlerine gerek kalmaz.
+
+        Whisper'ın ham segmentleri (~4-9 saniyelik VAD parçaları) genelde bir
+        cümlenin ortasında bitiyor. Bu yüzden segmentleri cümle sonu
+        noktalamasına (. ! ?) kadar biriktirip tek bir transkript satırı
+        olarak veriyoruz - diarizasyon için gereken zaman bilgisi, biriken
+        grubun İLK segmentinin başlangıcından alınır.
+        """
+        segments, _info = self._model.transcribe(audio_path, **self._whisper_params())
+
+        SENTENCE_END = re.compile(r'[.!?]["\')]?\s*$')
+        MAX_GROUP_SPAN_S = 40.0  # noktalama hiç gelmezse sonsuza kadar biriktirmeyi engelle
+
+        def is_sentence_end(seg_text: str) -> bool:
+            # "..." / "…" konuşmacının cümleyi yarım bırakıp duraksadığını
+            # gösterir (Whisper'ın kendi konvansiyonu) - gerçek cümle sonu
+            # değil, aksi halde "Bu altı ay... acaba... yapay zeka..." gibi
+            # tek bir düşünce yanlışlıkla üçe/dörde bölünür.
+            if seg_text.endswith("...") or seg_text.endswith("…"):
+                return False
+            return bool(SENTENCE_END.search(seg_text))
+
+        results: List[Tuple[float, TranscriptionResult]] = []
+        buffer: list = []
+        buffer_start: Optional[float] = None
+
+        def flush() -> None:
+            if not buffer:
+                return
+            valid_segments, confidence = self.halucination_filter.filter_segments(buffer)
+            text = " ".join(s.text for s in valid_segments).strip()
+            result = self.halucination_filter.build_result(text, valid_segments, confidence, 0.0)
+            if result.status != TranscriptionStatus.SILENCE and result.text:
+                results.append((buffer_start, result))
+
+        for seg in segments:
+            if buffer_start is None:
+                buffer_start = seg.start
+            buffer.append(seg)
+            if is_sentence_end(seg.text.strip()) or (seg.end - buffer_start) >= MAX_GROUP_SPAN_S:
+                flush()
+                buffer = []
+                buffer_start = None
+        flush()
+
+        return results
 
     # ── Dolgu Kelimesi Temizleme (Ollama) ──────────────────────────────────
 
@@ -284,6 +365,7 @@ class STTPipeline:
             "model": self.config.ollama_model,
             "prompt": prompt,
             "stream": False,
+            "think": False,  # thinking modelleri tüm bütçeyi muhakemede tüketip boş cevap dönebiliyor
             "options": {"temperature": 0.0},
         }
         try:
@@ -339,28 +421,35 @@ class STTPipeline:
         gerekirse Ollama ile dolgu kelimelerini temizler ve tamponu temizler.
         """
         if self._buffer.size == 0:
+            logger.debug("Buffer boş, transkripsiyon yapılmıyor")
             return
 
         result = self._transcribe()
 
+        # Debug: Her transkripsiyon sonucunu logla
+        logger.info(f"Transkripsiyon: status={result.status}, text='{result.text}', confidence={result.confidence:.2f}")
+
+        # Sonucu her zaman ilet (SILENCE bile)
+        self.on_result(result)
+
         if result.status == TranscriptionStatus.SILENCE or not result.text:
             # Ses vardı ama anlamlı metin çıkmadı → temizle, devam et
+            logger.warning("SILENCE veya boş metin - transkript kaydedildi ama işlemeye devam etmiyor")
             self._clear_buffer()
             return
-
-        # Sonucu ilet
-        self.on_result(result)
 
         full_text = result.text.strip()
 
         # ── Ollama Dolgu Kelimesi Temizleme ───────────────────────────
         if self.config.use_ollama:
             cleaned_text = self._clean_filler_words(full_text)
-            print(f"\n[Ollama ile Temizlenmiş Metin]: {cleaned_text}")
+            if not self.silent:
+                print(f"\n[Ollama ile Temizlenmiş Metin]: {cleaned_text}")
             full_text = cleaned_text
 
-        print(f"\n>>> NİHAİ İSTEK YAKALANDI: {full_text}\n")
-        print("--- Yeni Cümle Bekleniyor ---\n")
+        if not self.silent:
+            print(f"\n>>> NİHAİ İSTEK YAKALANDI: {full_text}\n")
+            print("--- Yeni Cümle Bekleniyor ---\n")
 
         # Ses tamponunu her zaman temizle → bir sonraki konuşma taze başlar
         self._clear_buffer()
@@ -378,13 +467,26 @@ class STTPipeline:
 
         Bu sayede her cümle sadece 1 kez işlenir. Sıfır tekrar.
         """
-        print("Sistem Hazır! Konuşmaya başlayın (Çıkmak için CTRL+C)\n")
+        print("\n🎧 Sistem Hazır! Konuşmaya başlayın (Çıkmak için CTRL+C)\n")
+
+        # Cihazın gerçek giriş kanal sayısını kullan (ör. mikrofon + BlackHole
+        # aggregate cihazı birden çok kanal taşır) → _audio_callback mono'ya indirger
+        if self.config.audio_device is not None:
+            device_info = sd.query_devices(self.config.audio_device)
+            input_channels = max(1, int(device_info["max_input_channels"]))
+        else:
+            input_channels = 1
 
         with sd.InputStream(
             samplerate=self.config.sample_rate,
-            channels=1,
+            channels=input_channels,
             dtype="float32",
             callback=self._audio_callback,
+            device=self.config.audio_device,
+            # Whisper CPU'yu yoğun kullanırken callback'in zamanında yetişememesi
+            # (xrun) ve aggregate cihazlardaki saat sapması kaynaklı kopmalara karşı
+            # daha geniş donanım tamponu.
+            latency="high",
         ):
             try:
                 while True:
@@ -437,7 +539,8 @@ class STTPipeline:
 
                     # else: konuşma yok, enerji yok → beklemeye devam
             except KeyboardInterrupt:
-                print("\nÇıkış yapılıyor...")
+                if not self.silent:
+                    print("\nÇıkış yapılıyor...")
                 if self._buffer.size > 0:
                     # Son cümle henüz sessizlik ile kapanmadıysa bile kaydet.
                     self._do_transcribe_and_output()
@@ -467,6 +570,7 @@ def clean_filler_words(text, ollama_url, ollama_model):
         "model": ollama_model,
         "prompt": prompt,
         "stream": False,
+        "think": False,  # thinking modelleri tüm bütçeyi muhakemede tüketip boş cevap dönebiliyor
         "options": {"temperature": 0.0},
     }
     try:
@@ -493,14 +597,16 @@ def run_stt_pipeline(
     ollama_url="http://localhost:11434/api/generate",
     ollama_model="qwen3.5:0.8b",
     rate=16000,
+    audio_device=None,
     chunk_duration_s=1.5,
     silence_threshold=0.01,
     end_of_speech_s=2.5,
+    max_speech_s=8.0,
     initial_prompt="",
     language="tr",
     vad_filter=True,
     word_timestamps=True,
-    # ── Yeni bankacılık düzeyi parametreler (varsayılanlarla) ──────────
+    # ── Ek halüsinasyon filtreleme parametreleri (varsayılanlarla) ──────
     beam_size=5,
     max_buffer_s=15.0,
     energy_threshold=None,
@@ -519,9 +625,11 @@ def run_stt_pipeline(
     use_ollama_summary=False,
     summary_ollama_url="http://127.0.0.1:11434/api/generate",
     summary_ollama_model="qwen3.5:0.8b",
+    use_diarization=True,
+    silent=False,
 ):
     """
-    Bankacılık düzeyinde Türkçe STT pipeline'ı.
+    Türkçe STT pipeline'ı.
 
     Geriye uyumlu fonksiyon arayüzü — main.py'deki çağrı şekli korunur.
     Tüm orijinal parametreler aynen kabul edilir. Yeni parametreler
@@ -535,9 +643,13 @@ def run_stt_pipeline(
         ollama_url: Ollama API adresi
         ollama_model: Ollama model adı
         rate: Ses örnekleme hızı (Hz)
+        audio_device: sounddevice giriş cihazı (index veya isim). None → sistem varsayılan mikrofon.
+            Teams gibi bir uygulamanın sesini de yakalamak için BlackHole + Aggregate Device
+            kurup buraya o cihazın adını/index'ini verin.
         chunk_duration_s: Anlık işleme süresi (saniye)
+        max_speech_s: Kesintisiz konuşma sınırı (saniye) — aşılırsa zorla transkript edilir
         silence_threshold: Sessizlik eşiği (enerji kapısı olarak kullanılır)
-        initial_prompt: Whisper ön-promptu (boşsa bankacılık promptu kullanılır)
+        initial_prompt: Whisper ön-promptu (kelime dağarcığı yönlendirme)
         language: Dil kodu
         vad_filter: VAD filtresi aç/kapat
         word_timestamps: Kelime zaman damgaları
@@ -565,18 +677,19 @@ def run_stt_pipeline(
         energy_threshold if energy_threshold is not None else silence_threshold
     )
 
-    # Boş initial_prompt → bankacılık alanı promptu
-    effective_prompt = initial_prompt if initial_prompt else BANKING_INITIAL_PROMPT
+    effective_prompt = initial_prompt
 
     config = STTConfig(
         whisper_model=whisper_model,
         device=device,
         compute_type=compute_type,
         sample_rate=rate,
+        audio_device=audio_device,
         chunk_duration_s=chunk_duration_s,
         max_buffer_s=max_buffer_s,
         energy_threshold=effective_energy,
         end_of_speech_s=end_of_speech_s,
+        max_speech_s=max_speech_s,
         beam_size=beam_size,
         temperature=0.0,
         language=language,
@@ -598,14 +711,21 @@ def run_stt_pipeline(
         force_transcription_on_max_speech=force_transcription_on_max_speech,
     )
 
-    # Logging ayarla (INFO seviyesi — DEBUG çok gürültülü)
+    # Logging ayarla (silent mode'da WARNING, aksi takdirde DEBUG)
+    log_level = logging.WARNING if silent else logging.DEBUG
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    # faster_whisper'ın DEBUG spam'ini sustur
-    logging.getLogger("faster_whisper").setLevel(logging.WARNING)
+    # Tüm loggers'ı sessiz mode'da sustur
+    if silent:
+        logging.getLogger().setLevel(logging.WARNING)
+        logging.getLogger("faster_whisper").setLevel(logging.WARNING)
+        logging.getLogger("diarization").setLevel(logging.WARNING)
+        logging.getLogger("pyannote").setLevel(logging.WARNING)
+    else:
+        logging.getLogger("faster_whisper").setLevel(logging.WARNING)
 
     print(f"[{whisper_model}] Yükleniyor...")
     meeting_assistant = None
@@ -618,6 +738,7 @@ def run_stt_pipeline(
             ollama_url=summary_ollama_url,
             ollama_model=summary_ollama_model,
             meeting_title=meeting_title,
+            use_diarization=use_diarization,
         )
 
     combined_on_result = on_result
@@ -633,6 +754,7 @@ def run_stt_pipeline(
         config=config,
         on_result=combined_on_result,
         on_audio_chunk=meeting_assistant.handle_audio if meeting_assistant else None,
+        silent=silent,
     )
 
     try:
@@ -640,9 +762,131 @@ def run_stt_pipeline(
     finally:
         if meeting_assistant is not None:
             artifacts = meeting_assistant.finalize()
-            print("\nToplantı çıktıları kaydedildi:")
-            print(f"- Klasör: {artifacts['session_dir']}")
-            print(f"- Transkript: {artifacts['transcript_path']}")
-            print(f"- Özet: {artifacts['summary_path']}")
-            if artifacts["audio_path"]:
-                print(f"- Ses kaydı: {artifacts['audio_path']}")
+            if not silent:
+                print("\nToplantı çıktıları kaydedildi:")
+                print(f"- Klasör: {artifacts['session_dir']}")
+                print(f"- Transkript: {artifacts['transcript_path']}")
+                print(f"- Özet: {artifacts['summary_path']}")
+                if artifacts["audio_path"]:
+                    print(f"- Ses kaydı: {artifacts['audio_path']}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# transcribe_recording — Bitmiş Bir Ses Dosyasını İşle (Canlı Mikrofon Değil)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def transcribe_recording(
+    audio_path: str,
+    # Batch modda gerçek zamanlı CPU kısıtı yok (kayıt bitmiş bir dosya,
+    # canlı mikrofonla yarışma derdi yok), bu yüzden daha isabetli
+    # transkripsiyon için "small" yerine "medium" kullanılabilir.
+    whisper_model: str = "medium",
+    device: str = "cpu",
+    compute_type: str = "int8",
+    language: str = "tr",
+    beam_size: int = 5,
+    initial_prompt: str = "",
+    meeting_output_dir: str = "meeting-notes",
+    meeting_title: str = "kayit",
+    use_ollama_summary: bool = True,
+    summary_ollama_url: str = "http://127.0.0.1:11434/api/generate",
+    summary_ollama_model: str = "qwen3.5:0.8b",
+    use_diarization: bool = False,
+) -> dict:
+    """Daha önce kaydedilmiş bir ses dosyasını (Teams kaydı, telefon kaydı vb.)
+    tek seferde transkript edip özetler. Canlı mikrofon akışı kullanmaz,
+    bu yüzden sessizlik/max-speech tahminlerine ve gerçek zamanlı CPU
+    kısıtlarına gerek yoktur.
+    """
+    # Yazılım/teknoloji ve bankacılık terimleri her transkripsiyonda otomatik
+    # kullanılır; burada verilen initial_prompt (ör. web arayüzündeki ek
+    # terimler) bunlara eklenir, üzerine yazmaz.
+    effective_prompt = f"{DEFAULT_TECHNICAL_TERMS} {BANKING_TERMS}"
+    if initial_prompt:
+        effective_prompt = f"{effective_prompt} {initial_prompt}"
+
+    config = STTConfig(
+        whisper_model=whisper_model,
+        device=device,
+        compute_type=compute_type,
+        language=language,
+        beam_size=beam_size,
+        temperature=0.0,
+        vad_filter=True,
+        word_timestamps=True,
+        suppress_blank=True,
+        condition_on_previous_text=False,
+        initial_prompt=effective_prompt,
+        # STTConfig'in varsayılan eşikleri canlı akış için sıkı tutulmuştu.
+        # Burada Whisper'ın kendi VAD'ı zaten sessizliği ayıklıyor, bu yüzden
+        # segment eşiklerini main.py'deki canlı moddaki gibi gevşetiyoruz -
+        # aksi halde kısa/gürültülü kayıtlarda tüm segmentler reddedilip
+        # transkript tamamen boş çıkabiliyor.
+        no_speech_threshold=0.95,
+        avg_logprob_threshold=-1.0,
+        compression_ratio_max=10.0,
+        accept_confidence=0.5,
+        low_confidence_min=0.3,
+    )
+
+    pipeline = STTPipeline(config=config, silent=True)
+
+    meeting_assistant = MeetingAssistant(
+        output_dir=meeting_output_dir,
+        sample_rate=config.sample_rate,
+        save_audio=False,
+        use_ollama_summary=use_ollama_summary,
+        ollama_url=summary_ollama_url,
+        ollama_model=summary_ollama_model,
+        meeting_title=meeting_title,
+        use_diarization=use_diarization,
+    )
+    # Diarization, canlı kayıttaki recording.wav yerine doğrudan verilen dosyayı kullansın.
+    meeting_assistant._audio_path = Path(audio_path)
+
+    # Whisper transkripsiyonu ve diarizasyon birbirinden bağımsız işlemler
+    # (ikisi de aynı ses dosyasını okuyor, biri diğerinin çıktısına ihtiyaç
+    # duymuyor). Sırayla değil paralel çalıştırarak toplam süreyi
+    # (whisper_süresi + diarizasyon_süresi) yerine max(ikisi) yapıyoruz.
+    diarization_future = None
+    if meeting_assistant._diarization_pipeline and meeting_assistant._diarization_pipeline.use_diarization:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        diarization_future = executor.submit(
+            meeting_assistant._diarization_pipeline.get_speaker_segments,
+            audio_path,
+            sr=config.sample_rate,
+        )
+
+    segment_results = pipeline.transcribe_file_segments(audio_path)
+
+    if diarization_future is not None:
+        try:
+            meeting_assistant.set_diarization_segments(diarization_future.result())
+        except Exception as e:
+            logger.warning("Paralel diarizasyon başarısız: %s", e)
+        finally:
+            executor.shutdown(wait=False)
+
+    for start_sec, result in segment_results:
+        meeting_assistant.add_segment(start_sec, result)
+    artifacts = meeting_assistant.finalize()
+
+    accepted = [r for _, r in segment_results if r.status == TranscriptionStatus.ACCEPTED]
+    overall_status = (
+        "ACCEPTED" if accepted
+        else "LOW_CONFIDENCE" if any(r.status == TranscriptionStatus.LOW_CONFIDENCE for _, r in segment_results)
+        else "REJECTED" if segment_results
+        else "SILENCE"
+    )
+    overall_confidence = (
+        sum(r.confidence for _, r in segment_results) / len(segment_results)
+        if segment_results else 0.0
+    )
+
+    return {
+        **artifacts,
+        "text": " ".join(r.text for _, r in segment_results).strip(),
+        "confidence": overall_confidence,
+        "status": overall_status,
+    }

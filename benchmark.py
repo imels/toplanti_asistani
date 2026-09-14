@@ -26,7 +26,7 @@ except Exception:
 
 # Kendi modelimizden importlar
 from core import STTPipeline
-from config import STTConfig, BANKING_INITIAL_PROMPT
+from config import STTConfig
 from models import TranscriptionResult
 
 # Uyarıları gizle

@@ -4,3 +4,13 @@ numpy>=1.22.0
 sounddevice>=0.4.6
 requests>=2.28.0
 
+# ── Web Arayüzü ────────────────────────────────────────────────────────────
+flask>=3.0.0
+fpdf2>=2.7.0
+
+# ── Speaker Diarization ────────────────────────────────────────────────────
+# huggingface_hub 1.x, pyannote.audio 3.4.0 ile uyumsuz (use_auth_token hatası
+# verir) - 1.0 altında sabitlenmeli.
+huggingface_hub>=0.23,<1.0
+pyannote.audio>=3.1.0
+

@@ -2,10 +2,10 @@
 Veri modelleri — TranscriptionResult ve yardımcı tipler.
 
 Her transkripsiyon sonucu bir güven skoru ve durum bilgisi taşır.
-Bankacılık uygulaması bu bilgilere göre karar verir:
+Bu bilgilere göre karar verilir:
   ACCEPTED       → Sonucu kullan
   LOW_CONFIDENCE → Kullan ama insan doğrulaması için işaretle
-  REJECTED       → Kullanma, müşteriden tekrar etmesini iste
+  REJECTED       → Kullanma, konuşmacıdan tekrar etmesini iste
   SILENCE        → Konuşma algılanmadı
 """
 
@@ -38,7 +38,7 @@ class TranscriptionResult:
     """
     Pipeline'ın ürettiği nihai sonuç.
 
-    Bankacılık uygulaması bu nesneyi alır ve status alanına göre
+    Tüketen uygulama bu nesneyi alır ve status alanına göre
     işlem yapar. confidence alanı denetim izi (audit trail) için
     loglanmalıdır.
     """

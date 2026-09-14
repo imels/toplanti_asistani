@@ -13,19 +13,30 @@ Katman sırası:
   9. Güven Birleştirme      → Ağırlıklı skor → durum kararı
 """
 
+import re
 import logging
 from typing import List, Tuple
 
 import numpy as np
 
-from config import TURKISH_HALLUCINATION_PATTERNS, STTConfig
+from config import TURKISH_FILLER_PATTERN, TURKISH_HALLUCINATION_PATTERNS, STTConfig
 from models import SegmentDetail, TranscriptionResult, TranscriptionStatus
 
 logger = logging.getLogger(__name__)
 
 
+def strip_filler_words(text: str) -> str:
+    """'eee', 'ııı' gibi dolgu/duraksama seslerini metinden temizler."""
+    cleaned = TURKISH_FILLER_PATTERN.sub("", text)
+    # Silinen kelimenin bıraktığı fazla boşlukları ve noktalama öncesi
+    # boşlukları toparla (ör. "birlikteyiz.  kalp" → "birlikteyiz. kalp")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"\s+([.,!?])", r"\1", cleaned)
+    return cleaned.strip()
+
+
 class HallucinationFilter:
-    """Bankacılık düzeyinde çok katmanlı filtreleme."""
+    """Çok katmanlı halüsinasyon filtreleme."""
 
     def __init__(self, config: STTConfig):
         self.config = config
@@ -182,6 +193,8 @@ class HallucinationFilter:
         processing_time_ms: float,
     ) -> TranscriptionResult:
         """Filtrelenmiş veriden TranscriptionResult oluştur."""
+
+        text = strip_filler_words(text)
 
         if not text or not text.strip():
             return TranscriptionResult(
