@@ -159,8 +159,43 @@ class DiarizationPipeline:
             return []
 
     def get_speaker_at_time(self, segments: List[Tuple[float, float, int]], time_sec: float) -> int:
-        """Belirli bir zaman anında hangi konuşmacı konuşuyor?"""
+        """Belirli bir zaman anında hangi konuşmacı konuşuyor?
+
+        pyannote segmentleri arasında küçük boşluklar bırakabiliyor (ör. iki
+        konuşmacı arasındaki mikro-sessizlik); sorgulanan an tam o boşluğa
+        denk gelirse, hemen "bilinmeyen konuşmacı"ya düşmek yerine, kısa bir
+        tolerans içinde en yakın segmente bakıyoruz - aksi halde transkriptte
+        gereksiz yere çok sayıda etiketsiz satır birikip, aslında bilinen bir
+        konuşmacıya ait sözler etiketsiz/kopuk görünüyordu.
+        """
+        GAP_TOLERANCE_S = 0.75
         for start, end, speaker_no in segments:
             if start <= time_sec <= end:
                 return speaker_no
-        return 0  # Hiçbir konuşmacı bulunamadı
+        best_speaker = 0
+        best_distance = GAP_TOLERANCE_S
+        for start, end, speaker_no in segments:
+            distance = start - time_sec if time_sec < start else time_sec - end
+            if distance < best_distance:
+                best_distance = distance
+                best_speaker = speaker_no
+        return best_speaker
+
+    def get_dominant_speaker(
+        self, segments: List[Tuple[float, float, int]], start_sec: float, end_sec: float
+    ) -> int:
+        """[start_sec, end_sec] aralığıyla en çok çakışan konuşmacıyı döndürür.
+
+        Tek bir ana (ör. segmentin başlangıcı) bakmak yerine örtüşme süresine
+        göre karar vermek daha sağlam - konuşmacı geçişi tam segmentin
+        başında olduğunda ya da diarizasyon sınırları Whisper segmentiyle
+        birebir örtüşmediğinde tek nokta bakışı yanlış konuşmacıyı seçebiliyor.
+        """
+        overlap_by_speaker: dict[int, float] = {}
+        for seg_start, seg_end, speaker_no in segments:
+            overlap = min(end_sec, seg_end) - max(start_sec, seg_start)
+            if overlap > 0:
+                overlap_by_speaker[speaker_no] = overlap_by_speaker.get(speaker_no, 0.0) + overlap
+        if not overlap_by_speaker:
+            return 0
+        return max(overlap_by_speaker, key=overlap_by_speaker.get)

@@ -23,7 +23,8 @@ DEFAULT_TECHNICAL_TERMS = (
     "staging, production, webhook, OAuth, JWT, SSO, REST API, GraphQL, gRPC, "
     "WebSocket, load balancer, CI/CD, unit test, entegrasyon testi, "
     "client, müşteri, change, change request, change management, ticket, "
-    "approval, CAB, rollout, environment, config, "
+    "approval, CAB, rollout, environment, config, middleware, MW, "
+    "device recognition, device fingerprinting, "
     # Bulut/altyapı araçları
     "AWS, Azure, Google Cloud, GCP, Kubernetes, Docker, Terraform, Ansible, "
     "Nginx, Jenkins, GitHub Actions, CircleCI, "
@@ -46,9 +47,10 @@ DEFAULT_TECHNICAL_TERMS = (
     "Grafana, Prometheus, Datadog, Sentry, Postman, Swagger, Selenium, "
     "Cypress, VSCode, IntelliJ, "
     # Git / sürüm kontrolü iş akışı
-    "commit, push, pull, merge, merge conflict, rebase, branch, checkout, "
-    "clone, fork, pull request, merge request, code review, cherry-pick, "
-    "squash, revert, stash, tag, changelog, hotfix, rollback, release, "
+    "commit, push, pull, merge, mergelemek, merge conflict, rebase, branch, "
+    "checkout, clone, fork, pull request, merge request, code review, "
+    "cherry-pick, squash, revert, stash, tag, changelog, hotfix, rollback, "
+    "release, "
     # Agile / Scrum toplantı terimleri
     "daily, daily stand-up, sprint planning, sprint review, retrospective, "
     "backlog, backlog grooming, refinement, story point, epic, kanban, "

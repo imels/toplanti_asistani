@@ -25,6 +25,7 @@ import time
 import queue
 import logging
 import concurrent.futures
+from collections import namedtuple
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -39,6 +40,11 @@ from meeting_assistant import MeetingAssistant
 from filters import HallucinationFilter
 
 logger = logging.getLogger(__name__)
+
+# word_timestamps bir segment için boş dönerse (ör. çok kısa/net olmayan ses),
+# o segmenti kelime listesi bekleyen kodun gözünde tek bir "kelimeymiş" gibi
+# ele almak için kullanılan basit yer tutucu.
+_FallbackWord = namedtuple("_FallbackWord", ["start", "end", "word"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -289,7 +295,12 @@ class STTPipeline:
             processing_ms,
         )
 
-    def transcribe_file_segments(self, audio_path: str) -> List[Tuple[float, TranscriptionResult]]:
+    def transcribe_file_segments(
+        self,
+        audio_path: str,
+        diarization_segments: Optional[List[Tuple[float, float, int]]] = None,
+        diarization_pipeline=None,
+    ) -> List[Tuple[float, TranscriptionResult]]:
         """Bitmiş bir ses dosyasını (canlı mikrofon değil) segment segment transkript eder.
 
         Her segment kendi (dosya başından itibaren saniye) zaman damgasıyla
@@ -307,8 +318,17 @@ class STTPipeline:
         noktalamasına (. ! ?) kadar biriktirip tek bir transkript satırı
         olarak veriyoruz - diarizasyon için gereken zaman bilgisi, biriken
         grubun İLK segmentinin başlangıcından alınır.
+
+        diarization_segments verilirse, biriktirme SADECE noktalama/süre
+        sınırında değil, konuşmacı değiştiğinde de kesilir - aksi halde biri
+        konuşurken araya kısa bir şey söyleyen başka bir konuşmacının sözleri
+        (Whisper aralarında cümle sonu noktalaması koymadıysa) aynı gruba
+        girip tek bir konuşmacının repliğiymiş gibi görünüyordu.
         """
-        segments, _info = self._model.transcribe(audio_path, **self._whisper_params())
+        # Generator'ı burada tüketiyoruz (Whisper'ın asıl hesaplama maliyeti
+        # burada oluşuyor) - diarizasyon sonucunu gruplama sırasında
+        # kullanabilmek için, akış halinde değil tam liste olarak alıyoruz.
+        raw_segments = list(self._model.transcribe(audio_path, **self._whisper_params())[0])
 
         SENTENCE_END = re.compile(r'[.!?]["\')]?\s*$')
         MAX_GROUP_SPAN_S = 40.0  # noktalama hiç gelmezse sonsuza kadar biriktirmeyi engelle
@@ -322,22 +342,43 @@ class STTPipeline:
                 return False
             return bool(SENTENCE_END.search(seg_text))
 
+        def dominant_speaker(seg) -> int:
+            if diarization_segments is None or diarization_pipeline is None:
+                return 0
+            return diarization_pipeline.get_dominant_speaker(diarization_segments, seg.start, seg.end)
+
         results: List[Tuple[float, TranscriptionResult]] = []
         buffer: list = []
         buffer_start: Optional[float] = None
+        buffer_speaker: int = 0
 
         def flush() -> None:
             if not buffer:
                 return
             valid_segments, confidence = self.halucination_filter.filter_segments(buffer)
-            text = " ".join(s.text for s in valid_segments).strip()
-            result = self.halucination_filter.build_result(text, valid_segments, confidence, 0.0)
-            if result.status != TranscriptionStatus.SILENCE and result.text:
-                results.append((buffer_start, result))
+            if not valid_segments:
+                return
 
-        for seg in segments:
+            for sub_start, sub_text in self._split_by_word_speaker(
+                valid_segments, diarization_segments, diarization_pipeline
+            ):
+                result = self.halucination_filter.build_result(sub_text, valid_segments, confidence, 0.0)
+                if result.status != TranscriptionStatus.SILENCE and result.text:
+                    results.append((sub_start, result))
+
+        for seg in raw_segments:
+            seg_speaker = dominant_speaker(seg)
+            speaker_changed = (
+                buffer and buffer_speaker > 0 and seg_speaker > 0 and seg_speaker != buffer_speaker
+            )
+            if speaker_changed:
+                flush()
+                buffer = []
+                buffer_start = None
+
             if buffer_start is None:
                 buffer_start = seg.start
+                buffer_speaker = seg_speaker
             buffer.append(seg)
             if is_sentence_end(seg.text.strip()) or (seg.end - buffer_start) >= MAX_GROUP_SPAN_S:
                 flush()
@@ -346,6 +387,66 @@ class STTPipeline:
         flush()
 
         return results
+
+    @staticmethod
+    def _split_by_word_speaker(
+        valid_segments: list,
+        diarization_segments: Optional[List[Tuple[float, float, int]]],
+        diarization_pipeline,
+    ) -> List[Tuple[float, str]]:
+        """Bir grup segmentin metnini, KELİME seviyesinde konuşmacı değişimine
+        göre alt satırlara böler.
+
+        Segment seviyesinde bölmek (transcribe_file_segments'taki ana döngü)
+        çoğu araya-girmeyi yakalıyor, ama biri konuşurken araya kısa bir şey
+        söyleyen başka bir konuşmacının sözleri, Whisper'ın VAD'ı bunu ayrı
+        bir segment olarak algılamadıysa (aralarında yeterli sessizlik yoksa)
+        hâlâ aynı segmentin içinde kalabiliyordu. word_timestamps zaten açık
+        olduğu için (bkz. config.py), her kelimenin kendi zaman damgası var -
+        bunu diarizasyonla eşleştirip tam kelime sınırında bölmek, yeni bir
+        model çalıştırmadan (sıfıra yakın ek maliyetle) çok daha isabetli bir
+        ayrım sağlıyor.
+        """
+        if diarization_segments is None or diarization_pipeline is None:
+            text = " ".join(s.text for s in valid_segments).strip()
+            return [(valid_segments[0].start, text)] if text else []
+
+        groups: List[Tuple[float, list]] = []  # (start, [kelime_metinleri])
+        current_speaker = 0
+
+        for seg in valid_segments:
+            words = getattr(seg, "words", None)
+            if not words:
+                # word_timestamps bir sebeple boş döndüyse (ör. çok kısa/net
+                # olmayan segment) segmenti tek parça olarak ele al.
+                words = [_FallbackWord(seg.start, seg.end, seg.text)]
+            for word in words:
+                w_speaker = diarization_pipeline.get_dominant_speaker(
+                    diarization_segments, word.start, word.end
+                )
+                speaker_changed = (
+                    groups and current_speaker > 0 and w_speaker > 0 and w_speaker != current_speaker
+                )
+                if speaker_changed or not groups:
+                    groups.append((word.start, [word.word]))
+                else:
+                    groups[-1][1].append(word.word)
+                if w_speaker > 0:
+                    current_speaker = w_speaker
+
+        def smart_join(words: list) -> str:
+            # faster-whisper kelimeleri normalde kendi baştaki boşluğunu
+            # taşır (" merhaba"), ama bir segmentin İLK kelimesi bunu her
+            # zaman taşımayabiliyor - bu durumda iki kelime boşluksuz
+            # birleşip "birweb" gibi hatalı bitişik kelimeler oluşuyordu.
+            text = ""
+            for word in words:
+                if text and not text[-1].isspace() and word and not word[0].isspace():
+                    text += " "
+                text += word
+            return text.strip()
+
+        return [(start, joined) for start, words in groups if (joined := smart_join(words))]
 
     # ── Dolgu Kelimesi Temizleme (Ollama) ──────────────────────────────────
 
@@ -858,15 +959,25 @@ def transcribe_recording(
             sr=config.sample_rate,
         )
 
-    segment_results = pipeline.transcribe_file_segments(audio_path)
-
+    diar_segments = None
     if diarization_future is not None:
         try:
-            meeting_assistant.set_diarization_segments(diarization_future.result())
+            diar_segments = diarization_future.result()
+            meeting_assistant.set_diarization_segments(diar_segments)
         except Exception as e:
             logger.warning("Paralel diarizasyon başarısız: %s", e)
         finally:
             executor.shutdown(wait=False)
+
+    # Diarizasyon sonucu, Whisper segmentlerini cümle sonuna göre gruplarken
+    # de kullanılıyor - böylece araya giren farklı bir konuşmacının sözleri,
+    # aralarında noktalama olmasa bile önceki konuşmacının repliğine
+    # karışmadan ayrı bir satır olarak kalıyor.
+    segment_results = pipeline.transcribe_file_segments(
+        audio_path,
+        diarization_segments=diar_segments,
+        diarization_pipeline=meeting_assistant._diarization_pipeline,
+    )
 
     for start_sec, result in segment_results:
         meeting_assistant.add_segment(start_sec, result)
